@@ -1,0 +1,203 @@
+---
+title: "Summary Table and Figures for WGS HG002 defrabb benchmarks"
+date: '`r Sys.Date()`'
+author: "Add your name here"
+format: html
+editor: visual
+---
+
+```{r setup}
+#| include=FALSE,
+#| echo=TRUE
+library(tidyverse)
+library(here)
+```
+
+
+
+## Background
+
+Summary table and figure for HG002 Q100 whole genome small and structural variant benchmark sets.
+
+### Table
+
+Variant stats from bcftools stats output and region size and coverage from bedtools summary output.
+
+_Columns:_ REF, Benchmark type, Number of SNVs, Number of Indels, Region Bases, Genome Coverage
+
+
+### Figure
+
+- Distribution of SV lengths: based on variant sizes calculated from bcftools query output.
+
+# Analyses
+
+
+## Summary Table
+
+```{r}
+parse_bcftools_stats <- function(stats_file) {
+  sn_lst = read_lines(stats_file) %>%
+    .[str_detect(., "^SN")] %>%
+    str_remove("SN\t0\tnumber of ")
+  sn_tbl <- tibble(sn = sn_lst) %>%
+    separate(col = sn,
+             into = c("metric", "value"),
+             sep = ":\t")
+  sn_tbl %>%
+    pivot_wider(names_from = "metric", values_from = "value") %>%
+    select(-c(
+      samples,
+      `no-ALTs`,
+      MNPs,
+      others,
+      `multiallelic sites`,
+      `multiallelic SNP sites`
+    ))
+}
+
+var_stats_tbl <- list.files(pattern = "stats.txt.gz", include.dirs = TRUE, recursive = TRUE) %>% 
+  set_names(str_extract(., "(?<=data/).*(?=.stats.txt.gz)")) %>% 
+  map_dfr(parse_bcftools_stats, .id = "benchset") %>% 
+  separate(benchset, into = c("ref","bench_type")) %>% 
+  arrange(bench_type) %>% 
+  mutate(records = format(as.integer(records), big.mark = ","),
+         SNPs = format(as.integer(SNPs), big.mark = ","),
+         indels = format(as.integer(indels), big.mark = ","),
+         )
+
+chroms <- c(1:22, "X","Y") %>% c(., paste0("chr", .))
+
+## Hard coding assembly size based on HG002 T2T 1.0.1 maternal
+## Value provided by Justin Zook 
+## based on the fai file, the HG002 size is 3113951008 for chr1-22,X,Y https://s3-us-west-2.amazonaws.com/human-pangenomics/T2T/HG002/assemblies/hg002v1.0.1.mat_Y_EBV_MT.fasta.gz.fai
+asm_size <- 3113951008 
+regions_tbl <-
+  list.files(pattern = "bed-summary.tsv.gz",
+             include.dirs = TRUE,
+             recursive = TRUE) %>%
+  set_names(str_extract(., "(?<=data/).*(?=.benchmark_bed-summary.tsv.gz)")) %>%
+  map_dfr(read_tsv, show_col_types = FALSE, .id = "benchset") %>%
+  separate(
+    col = "benchset",
+    into = c("ref", "asm_id", "bench_type", "varcaller"),
+    sep = "_"
+  ) %>%
+  select(-asm_id,-varcaller) %>%
+  filter(chrom %in% chroms) %>%
+  group_by(ref, bench_type) %>%
+  summarise(total_ivl_bp = sum(total_ivl_bp),
+            chrom_length = sum(chrom_length)) %>%
+  mutate(pct_covered = 100 * (total_ivl_bp / asm_size)) %>%
+  mutate(ref = if_else(ref == "CHM13v2.0", "CHM13", ref)) %>% 
+  select(-chrom_length) %>% 
+  mutate(total_ivl_bp = format(total_ivl_bp, big.mark = ","),
+        pct_covered = round(pct_covered, 2)
+         )
+
+bench_metrics_tbl <- left_join(var_stats_tbl, regions_tbl)
+write_tsv(bench_metrics_tbl, "bench_metrics_tbl.txt.gz")
+
+bench_metrics_tbl
+```
+
+
+
+## SV length plot 
+
+```{r}
+get_var_len <- function(vcf_tsv){
+  chroms <- c(1:22, "X", "Y") %>% c(., paste0("chr", .))
+  vcf_tbl <-
+    read_tsv(
+      vcf_tsv,
+      col_names = c("chrom", "pos", "ref", "alt", "gt"),
+      col_types = "cdccc"
+    )
+  
+  var_len_tbl <- vcf_tbl %>%
+    mutate(
+      alt = str_remove(alt, ",\\*|\\*,"),
+      ref_len = nchar(ref),
+      alt_len = nchar(alt),
+      var_len = if_else(ref_len > alt_len,-ref_len, alt_len)
+    ) %>%
+    filter(chrom %in% chroms) %>%
+    select(-ref,-alt)
+  
+  var_len_tbl
+}
+
+var_len_tbl <-
+  list.files(pattern = "var.tsv.gz",
+             include.dirs = TRUE,
+             recursive = TRUE) %>%
+  set_names(str_extract(., "(?<=data/).*(?=.tsv.gz)")) %>%
+  map_dfr(get_var_len, .id = "benchset") %>%
+  separate(benchset, into = c("ref", "bench_type"))
+```
+
+```{r}
+var_len_tbl %>% filter(bench_type == "stvar", abs(var_len) < 10000) %>%
+  ggplot() + geom_histogram(aes(x = var_len), bins = 100, na.rm = TRUE) +
+  facet_wrap( ~ ref, ncol = 1) +
+  scale_x_continuous(
+    breaks = c(
+      -10000,
+      -7500,
+      -5000,
+      -2500,
+      -1000,
+      -500,
+      -250,
+      250,
+      500,
+      1000,
+      2500,
+      5000,
+      7500,
+      10000
+    )
+  ) +
+  theme_bw()
+```
+
+```{r}
+var_len_tbl %>% filter(bench_type == "stvar", abs(var_len) < 10000) %>% 
+  mutate(var_type = if_else(var_len > 0, "Insertion", "Deletion")) %>% 
+ggplot() + geom_histogram(aes(x = abs(var_len)), bins = 100, na.rm = TRUE) + 
+  facet_grid(ref~var_type) + 
+  scale_x_log10(breaks = c(50, 100, 250, 500, 1000, 2500, 5000, 7500, 10000)) +
+  theme_bw() + 
+  theme(axis.text.x = element_text(angle = -45, hjust = 0)) +
+  labs(x = "Variant Length (bp)", y = "Count")
+```
+
+```{r}
+ggsave("sv_len_plot.pdf", width = 11, height = 4, units = "in")
+```
+
+
+## Conclusions
+
+-   Brief concluding remarks about the analyses performed.
+-   Any bugs or issues identified while performing the analyses.
+
+# Session Information
+
+The following sections (in addition to the header) provide the **WHO** and **WHERE** for the analyses was performed.
+
+## System Information
+
+```{r}
+sessioninfo::platform_info()
+```
+
+## Package Versions
+
+```{r}
+sessioninfo::package_info() %>% 
+    filter(attached = TRUE) %>% 
+    select(package, loadedversion, date, source) %>%
+    knitr::kable(booktabs = TRUE, row.names = FALSE)
+```
